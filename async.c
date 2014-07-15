@@ -136,6 +136,9 @@ static redisAsyncContext *redisAsyncInitialize(redisContext *c) {
     ac->sub.invalid.tail = NULL;
     ac->sub.channels = dictCreate(&callbackDict,NULL);
     ac->sub.patterns = dictCreate(&callbackDict,NULL);
+
+    pthread_mutex_init(&ac->lock, NULL);
+    
     return ac;
 }
 
@@ -213,7 +216,7 @@ int redisAsyncSetDisconnectCallback(redisAsyncContext *ac, redisDisconnectCallba
 }
 
 /* Helper functions to push/shift callbacks */
-static int __redisPushCallback(redisCallbackList *list, redisCallback *source) {
+static int __redisPushCallback(redisAsyncContext *ac, redisCallbackList *list, redisCallback *source) {
     redisCallback *cb;
 
     /* Copy callback from stack to heap */
@@ -226,28 +229,44 @@ static int __redisPushCallback(redisCallbackList *list, redisCallback *source) {
         cb->next = NULL;
     }
 
+    pthread_mutex_lock(&ac->lock);
+    
     /* Store callback in list */
     if (list->head == NULL)
         list->head = cb;
     if (list->tail != NULL)
         list->tail->next = cb;
     list->tail = cb;
+
+    pthread_mutex_unlock(&ac->lock);
+    
     return REDIS_OK;
 }
 
-static int __redisShiftCallback(redisCallbackList *list, redisCallback *target) {
+static int __redisShiftCallback(redisAsyncContext *ac, redisCallbackList *list, redisCallback *target) {
     redisCallback *cb = list->head;
+    
     if (cb != NULL) {
-        list->head = cb->next;
-        if (cb == list->tail)
-            list->tail = NULL;
+        pthread_mutex_lock(&ac->lock);
 
-        /* Copy callback from heap to stack */
-        if (target != NULL)
-            memcpy(target,cb,sizeof(*cb));
-        free(cb);
+        cb = list->head;
+
+        if (cb != NULL) {
+            list->head = cb->next;
+            if (cb == list->tail)
+                list->tail = NULL;
+
+            /* Copy callback from heap to stack */
+            if (target != NULL)
+                memcpy(target, cb, sizeof(*cb));
+            free(cb);
+        }
+                
+        pthread_mutex_unlock(&ac->lock);
+        
         return REDIS_OK;
     }
+    
     return REDIS_ERR;
 }
 
@@ -268,11 +287,11 @@ static void __redisAsyncFree(redisAsyncContext *ac) {
     dictEntry *de;
 
     /* Execute pending callbacks with NULL reply. */
-    while (__redisShiftCallback(&ac->replies,&cb) == REDIS_OK)
+    while (__redisShiftCallback(ac, &ac->replies,&cb) == REDIS_OK)
         __redisRunCallback(ac,&cb,NULL);
 
     /* Execute callbacks for invalid commands */
-    while (__redisShiftCallback(&ac->sub.invalid,&cb) == REDIS_OK)
+    while (__redisShiftCallback(ac, &ac->sub.invalid,&cb) == REDIS_OK)
         __redisRunCallback(ac,&cb,NULL);
 
     /* Run subscription callbacks callbacks with NULL reply */
@@ -325,7 +344,7 @@ static void __redisAsyncDisconnect(redisAsyncContext *ac) {
 
     if (ac->err == 0) {
         /* For clean disconnects, there should be no pending callbacks. */
-        assert(__redisShiftCallback(&ac->replies,NULL) == REDIS_ERR);
+        assert(__redisShiftCallback(ac, &ac->replies,NULL) == REDIS_ERR);
     } else {
         /* Disconnection is caused by an error, make sure that pending
          * callbacks cannot call new commands. */
@@ -392,14 +411,14 @@ static int __redisGetSubscribeCallback(redisAsyncContext *ac, redisReply *reply,
         sdsfree(sname);
     } else {
         /* Shift callback for invalid commands. */
-        __redisShiftCallback(&ac->sub.invalid,dstcb);
+        __redisShiftCallback(ac,&ac->sub.invalid,dstcb);
     }
     return REDIS_OK;
 }
 
 void redisProcessCallbacks(redisAsyncContext *ac) {
     redisContext *c = &(ac->c);
-    redisCallback cb = {NULL, NULL, NULL};
+    redisCallback cb;
     void *reply = NULL;
     int status;
 
@@ -411,10 +430,10 @@ void redisProcessCallbacks(redisAsyncContext *ac) {
                 __redisAsyncDisconnect(ac);
                 return;
             }
-
+            
             /* If monitor mode, repush callback */
             if(c->flags & REDIS_MONITORING) {
-                __redisPushCallback(&ac->replies,&cb);
+                __redisPushCallback(ac, &ac->replies,&cb);
             }
 
             /* When the connection is not being disconnected, simply stop
@@ -424,7 +443,7 @@ void redisProcessCallbacks(redisAsyncContext *ac) {
 
         /* Even if the context is subscribed, pending regular callbacks will
          * get a reply before pub/sub messages arrive. */
-        if (__redisShiftCallback(&ac->replies,&cb) != REDIS_OK) {
+        if (__redisShiftCallback(ac, &ac->replies,&cb) != REDIS_OK) {
             /*
              * A spontaneous reply in a not-subscribed context can be the error
              * reply that is sent when a new connection exceeds the maximum
@@ -524,6 +543,7 @@ void redisAsyncHandleRead(redisAsyncContext *ac) {
 void redisAsyncHandleWrite(redisAsyncContext *ac) {
     redisContext *c = &(ac->c);
     int done = 0;
+    int status;
 
     if (!(c->flags & REDIS_CONNECTED)) {
         /* Abort connect was not successful. */
@@ -534,7 +554,13 @@ void redisAsyncHandleWrite(redisAsyncContext *ac) {
             return;
     }
 
-    if (redisBufferWrite(c,&done) == REDIS_ERR) {
+    pthread_mutex_lock(&ac->lock);
+
+    status = redisBufferWrite(c,&done);
+    
+    pthread_mutex_unlock(&ac->lock);
+
+    if (status == REDIS_ERR) {
         __redisAsyncDisconnect(ac);
     } else {
         /* Continue writing when not done, stop writing otherwise */
@@ -613,17 +639,19 @@ static int __redisAsyncCommand(redisAsyncContext *ac, redisCallbackFn *fn, void 
      } else if(strncasecmp(cstr,"monitor\r\n",9) == 0) {
          /* Set monitor flag and push callback */
          c->flags |= REDIS_MONITORING;
-         __redisPushCallback(&ac->replies,&cb);
+         __redisPushCallback(ac, &ac->replies,&cb);
     } else {
         if (c->flags & REDIS_SUBSCRIBED)
             /* This will likely result in an error reply, but it needs to be
              * received and passed to the callback. */
-            __redisPushCallback(&ac->sub.invalid,&cb);
+            __redisPushCallback(ac, &ac->sub.invalid,&cb);
         else
-            __redisPushCallback(&ac->replies,&cb);
+            __redisPushCallback(ac, &ac->replies,&cb);
     }
 
+    pthread_mutex_lock(&ac->lock);
     __redisAppendCommand(c,cmd,len);
+    pthread_mutex_unlock(&ac->lock);
 
     /* Always schedule a write when the write buffer is non-empty */
     _EL_ADD_WRITE(ac);

@@ -32,6 +32,7 @@
 #ifndef __HIREDIS_ASYNC_H
 #define __HIREDIS_ASYNC_H
 #include "hiredis.h"
+#include <pthread.h>
 
 #ifdef __cplusplus
 extern "C" {
@@ -98,6 +99,8 @@ typedef struct redisAsyncContext {
         struct dict *channels;
         struct dict *patterns;
     } sub;
+
+    pthread_mutex_t lock;
 } redisAsyncContext;
 
 /* Functions that proxy to hiredis */
